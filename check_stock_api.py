@@ -10,7 +10,7 @@ BASE_URL = 'https://chiikawamarket.jp'
 # 您要監控的商品網址清單
 # 程式將會自動從這些網址中解析出 Variant ID 和 Product ID
 PRODUCTS_URLS_TO_MONITOR = [
-    'https://chiikawamarket.jp/products/4582662964709', # 範例商品
+    'https://chiikawamarket.jp/products/4550213567808', # 範例商品
     # 'https://chiikawamarket.jp/products/YOUR_OTHER_PRODUCT_URL_HERE', # 加入其他要監控的商品網址
     # 'https://nagano-market.jp/products/YOUR_NAGANO_MARKET_URL_HERE', # 也支援 nagano-market.jp
 ]
