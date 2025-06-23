@@ -16,7 +16,9 @@ PRODUCTS_URLS_TO_MONITOR = [
 ]
 # --- 替換結束 ---
 
-MAX_QUANTITY = 1000000
+# 將最大數量調整為 999，避免觸發網站 API 的數量限制錯誤 (例如 422 錯誤)。
+# 即使設置為 999，網站也會自動限制為實際庫存量。
+MAX_QUANTITY = 400 
 
 class CartAPI:
     def __init__(self, base_url):
@@ -26,7 +28,7 @@ class CartAPI:
     def _request(self, method, path, **kwargs):
         url = f"{self.base_url}{path}"
         response = self.session.request(method, url, **kwargs)
-        response.raise_for_status()
+        response.raise_for_status() # 檢查請求是否成功，如果失敗則拋出異常
         return response
 
     def get_cart(self):
@@ -184,6 +186,7 @@ def check_product_stock(product_info):
         if 200 <= add_status < 300:
             print(f"成功發送加入購物車請求 (狀態碼: {add_status})。")
         else:
+            # 如果還是發生 4xx 錯誤，請檢查錯誤訊息，可能是其他問題 (例如 section-id 不正確)
             print(f"錯誤: 加入購物車請求失敗 (狀態碼: {add_status})。")
             print("無法確定庫存，請檢查 BASE_URL 和商品 ID 是否正確，或網站是否更改了 API。")
             return
@@ -228,4 +231,3 @@ if __name__ == "__main__":
     else:
         for product_info in monitored_products_data:
             check_product_stock(product_info)
-
