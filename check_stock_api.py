@@ -2,6 +2,7 @@
 import requests
 import json
 import datetime
+import time # 引入 time 模組用於延遲
 from bs4 import BeautifulSoup # 引入 BeautifulSoup 用於解析 HTML
 
 # --- 請在此處替換為您的實際資訊 ---
@@ -16,26 +17,50 @@ PRODUCTS_URLS_TO_MONITOR = [
 ]
 # --- 替換結束 ---
 
-# 用於二分搜尋的上限值。即使設定較大，程式也會透過二分搜尋找到實際庫存。
-# 這個值應足夠大，以包含任何可能的真實庫存上限，但也不宜過於龐大導致搜尋時間過長。
-BINARY_SEARCH_UPPER_BOUND = 300
+# 第一次嘗試加入購物車的數量。
+# 如果此數量失敗 (422)，則在 0 到此數量之間進行二分搜尋。
+# 如果此數量成功 (2xx)，則在此數量到 BINARY_SEARCH_MAX_UPPER_BOUND 之間進行二分搜尋。
+INITIAL_TEST_QUANTITY = 300 
+
+# 二分搜尋的絕對上限值。確保此值大於網站可能出現的任何最大庫存。
+BINARY_SEARCH_MAX_UPPER_BOUND = 10000
 
 class CartAPI:
     def __init__(self, base_url):
         self.base_url = base_url
         self.session = requests.Session()
 
-    def _request(self, method, path, **kwargs):
-        url = f"{self.base_url}{path}"
-        response = self.session.request(method, url, **kwargs)
-        response.raise_for_status() # 檢查請求是否成功，如果失敗則拋出異常
-        return response
+    def _send_request_with_retry(self, method, url_path, retries=3, backoff_factor=0.5, **kwargs):
+        """
+        發送 HTTP 請求的輔助函數，帶有重試機制。
+        處理連線錯誤和可重試的 HTTP 狀態碼 (例如 5xx)。
+        會返回 Response 物件，由呼叫者處理其狀態碼。
+        """
+        url = f"{self.base_url}{url_path}"
+        for i in range(retries):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                return response # 返回 Response 物件，呼叫者會檢查其狀態碼
+            except requests.exceptions.ConnectionError as e:
+                wait_time = backoff_factor * (2 ** i)
+                print(f"  連線失敗，第 {i+1}/{retries} 次重試，等待 {wait_time:.1f} 秒...")
+                time.sleep(wait_time)
+            except Exception as e: # 捕獲其他所有未知錯誤
+                print(f"  請求發生未知錯誤: {e}")
+                raise e # 重新拋出錯誤
+        raise requests.exceptions.RequestException(f"請求在 {retries} 次重試後仍然失敗: {url}")
 
     def get_cart(self):
-        response = self._request("GET", "/cart.js", headers={"accept": "*/*"})
+        # 獲取購物車內容，使用重試機制，並期望成功狀態碼
+        response = self._send_request_with_retry("GET", "/cart.js", headers={"accept": "*/*"})
+        response.raise_for_status() # 如果是 4xx 或 5xx 錯誤，將拋出異常 (除了 add_item)
         return response.json().get('items')
 
     def add_item(self, variant_id, product_id, quantity):
+        """
+        將商品加入購物車。此方法會返回 Response 物件，
+        呼叫者 (check_product_stock 或 _binary_search_stock) 需要自行檢查其狀態碼，尤其是 422。
+        """
         data = {
             "form_type": "product",
             "utf8": "✓",
@@ -45,12 +70,10 @@ class CartAPI:
             "section-id": "template--18391309091057__main", # 此值可能需要根據網站實際情況調整
         }
         # requests 會自動處理 form-data 的 Content-Type
-        response = self._request("POST", "/cart/add.js", data=data, headers={"X-Requested-With": "XMLHttpRequest"})
-        # 不在這裡直接 raise_for_status()，因為我們需要捕獲 422 錯誤來進行二分搜尋
-        return response
+        return self._send_request_with_retry("POST", "/cart/add.js", data=data, headers={"X-Requested-With": "XMLHttpRequest"})
 
     def get_item_quantity_in_cart(self, variant_id):
-        items = self.get_cart()
+        items = self.get_cart() # get_cart 已經包含重試和錯誤檢查
         if items:
             for item in items:
                 if str(item.get('id')) == str(variant_id):
@@ -58,7 +81,7 @@ class CartAPI:
         return -1
 
     def remove_item(self, variant_id):
-        items = self.get_cart()
+        items = self.get_cart() # get_cart 已經包含重試和錯誤檢查
         if not items:
             return 0
 
@@ -72,7 +95,8 @@ class CartAPI:
 
         if line_index != -1:
             payload = {"line": line_index, "quantity": 0}
-            self._request("POST", "/cart/change.js", json=payload, headers={"content-type": "application/json"})
+            response = self._send_request_with_retry("POST", "/cart/change.js", json=payload, headers={"content-type": "application/json"})
+            response.raise_for_status() # 對於移除操作，期望成功狀態碼
             return current_quantity
         return 0
 
@@ -158,6 +182,48 @@ def get_ids_from_product_url(product_url):
         return None, None
 
 
+def _binary_search_stock(cart_api, variant_id, product_id, low, high):
+    """
+    執行二分搜尋，找出最大的可加入數量 (即實際庫存)。
+    此函數假設傳入的 low 和 high 範圍是有效的。
+    """
+    actual_stock_found = 0 # 假設找到的實際庫存為 0
+    
+    while low <= high:
+        mid = (low + high) // 2
+        if mid == 0: # 避免嘗試加入 0 數量，如果 low 變成 0，則從 1 開始測試
+            mid = 1
+            if low == high: # 如果區間只有 0，則實際庫存為 0
+                return 0
+            
+        print(f"    二分搜尋嘗試加入數量: {mid} (範圍: {low}-{high})")
+        add_response = cart_api.add_item(variant_id, product_id, mid)
+
+        if 200 <= add_response.status_code < 300: # 成功加入 mid 數量
+            # 獲取購物車中實際的數量來確認
+            quantity_in_cart = cart_api.get_item_quantity_in_cart(variant_id)
+            cart_api.remove_item(variant_id) # 清理
+
+            if quantity_in_cart == mid:
+                # 實際加入數量等於嘗試數量，表示庫存至少有 mid
+                actual_stock_found = mid
+                low = mid + 1 # 嘗試尋找更多庫存
+            elif quantity_in_cart < mid and quantity_in_cart >= 0:
+                # 網站自動限制了數量，actual_added_in_cart 就是精確庫存
+                return quantity_in_cart 
+            else: # 獲取購物車數量異常 (例如 -1)
+                print(f"    警告: 二分搜尋時購物車數量異常: {quantity_in_cart} for quantity {mid}")
+                return actual_stock_found # 返回目前找到的最佳值
+        elif add_response.status_code == 422: # 失敗 (數量過高)
+            high = mid - 1 # 庫存小於 mid
+            print(f"    數量 {mid} 過高，API 返回 422。")
+        else: # 其他錯誤狀態碼
+            print(f"    錯誤: 二分搜尋時加入購物車請求失敗 (狀態碼: {add_response.status_code}) for quantity {mid}。")
+            return actual_stock_found # 返回目前找到的最佳值，表示發生錯誤
+
+    return actual_stock_found # 返回最終確定的庫存
+
+
 def check_product_stock(product_info):
     variant_id = product_info['variant_id']
     product_id = product_info['product_id']
@@ -168,7 +234,6 @@ def check_product_stock(product_info):
         return
 
     cart_api = CartAPI(BASE_URL)
-    initial_quantity_in_cart = 0
     actual_stock = -1 # 初始化實際庫存為 -1
 
     print(f"\n--- [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 檢查商品: {product_name} ---")
@@ -182,63 +247,36 @@ def check_product_stock(product_info):
         except requests.exceptions.RequestException as e:
             print(f"警告: 嘗試移除商品時發生錯誤 (可能購物車為空或網路問題): {e}")
 
-        # 步驟 2: 使用二分搜尋法找出可加入購物車的最大數量 (即實際庫存)
-        print(f"開始二分搜尋，尋找 '{product_name}' 的實際庫存...")
-        low = 1
-        high = BINARY_SEARCH_UPPER_BOUND
-        found_max_addable_quantity = 0
-
-        while low <= high:
-            mid = (low + high) // 2
-            print(f"  嘗試加入數量: {mid}")
-            add_response = cart_api.add_item(variant_id, product_id, mid)
+        # --- 步驟 2: 執行初始測試和二分搜尋 ---
+        print(f"執行初始測試，嘗試加入 {INITIAL_TEST_QUANTITY} 個商品...")
+        initial_add_response = cart_api.add_item(variant_id, product_id, INITIAL_TEST_QUANTITY)
+        
+        if 200 <= initial_add_response.status_code < 300: # 初始嘗試成功 (2xx)
+            quantity_in_cart_after_initial_add = cart_api.get_item_quantity_in_cart(variant_id)
+            cart_api.remove_item(variant_id) # 清理
             
-            if 200 <= add_response.status_code < 300: # 請求成功
-                # 如果成功加入 mid 數量，則可能庫存 >= mid
-                # 獲取購物車中實際的數量來確認
-                quantity_in_cart = cart_api.get_item_quantity_in_cart(variant_id)
-                # 清理這次加入的商品，為下一次嘗試做準備
-                cart_api.remove_item(variant_id)
+            if quantity_in_cart_after_initial_add == INITIAL_TEST_QUANTITY:
+                # 成功加入了 INITIAL_TEST_QUANTITY，庫存至少有這麼多，進行向上二分搜尋
+                print(f"  初始測試成功 ({INITIAL_TEST_QUANTITY} 個)。庫存可能更高，進行向上二分搜尋...")
+                actual_stock = _binary_search_stock(cart_api, variant_id, product_id, INITIAL_TEST_QUANTITY, BINARY_SEARCH_MAX_UPPER_BOUND)
+            elif quantity_in_cart_after_initial_add < INITIAL_TEST_QUANTITY and quantity_in_cart_after_initial_add >= 0:
+                # 網站自動限制了數量，這個實際加入的數量就是庫存
+                actual_stock = quantity_in_cart_after_initial_add
+                print(f"  初始測試自動限制數量為 {actual_stock}，確認為實際庫存。")
+            else: # 獲取購物車數量異常 (例如 -1)
+                print(f"  警告: 初始測試後獲取購物車數量異常: {quantity_in_cart_after_initial_add}")
+                actual_stock = -1 # 無法確定庫存
                 
-                if quantity_in_cart == mid:
-                    # 如果實際加入的數量等於我們嘗試的數量，說明還可以嘗試更多
-                    found_max_addable_quantity = mid
-                    low = mid + 1
-                elif quantity_in_cart < mid and quantity_in_cart >= 0:
-                    # 如果實際加入的數量小於嘗試的數量，說明 mid 太高了，
-                    # 並且 quantity_in_cart 可能是實際庫存
-                    found_max_addable_quantity = quantity_in_cart
-                    high = mid - 1 # 這裡應該是 high = quantity_in_cart 或是 low=1, high=quantity_in_cart 重新搜尋
-                    # 為了簡化，直接將 found_max_addable_quantity 設為 quantity_in_cart 並跳出，
-                    # 因為這表示我們找到了實際上限
-                    print(f"  實際加入數量為 {quantity_in_cart}，發現上限。")
-                    break 
-                else:
-                    # 購物車返回 -1 或其他不合理數量，可能是 API 異常
-                    print(f"  警告: 獲取購物車數量異常: {quantity_in_cart}")
-                    break # 跳出二分搜尋
+        elif initial_add_response.status_code == 422: # 初始嘗試失敗 (422)
+            # 庫存小於 INITIAL_TEST_QUANTITY，進行向下二分搜尋
+            print(f"  初始測試數量 {INITIAL_TEST_QUANTITY} 過高 (422)。庫存小於此數量，進行向下二分搜尋...")
+            actual_stock = _binary_search_stock(cart_api, variant_id, product_id, 0, INITIAL_TEST_QUANTITY - 1)
+            
+        else: # 其他錯誤狀態碼
+            print(f"  錯誤: 初始加入購物車請求失敗 (狀態碼: {initial_add_response.status_code})。無法進行庫存判斷。")
+            actual_stock = -2 # 表示發生了其他嚴重錯誤
 
-            elif add_response.status_code == 422: # 請求失敗，通常是因為數量過多
-                # 說明 mid 太高了
-                high = mid - 1
-                print(f"  數量 {mid} 過高，API 返回 422。")
-            else:
-                # 其他錯誤狀態碼，例如 404, 500 等
-                print(f"  錯誤: 加入購物車請求失敗 (狀態碼: {add_response.status_code})，無法進行二分搜尋。")
-                actual_stock = -2 # 表示錯誤
-                break # 跳出二分搜尋
-
-        if actual_stock != -2: # 如果沒有其他錯誤發生
-            # 二分搜尋結束後，found_max_addable_quantity 就是實際庫存
-            actual_stock = found_max_addable_quantity
-            # 為了最終確認，再次嘗試加入實際庫存量，並從購物車獲取最終數量
-            if actual_stock > 0:
-                cart_api.add_item(variant_id, product_id, actual_stock)
-                actual_stock = cart_api.get_item_quantity_in_cart(variant_id)
-            elif actual_stock == 0:
-                # 確保如果二分搜尋得出0，也實際檢查一下
-                pass # 無需再加入，因為期望是0
-
+        # --- 步驟 3: 報告最終結果 ---
         if actual_stock >= 0:
             print(f"✅ 商品庫存數量為: {actual_stock}")
             if actual_stock > 0:
@@ -246,7 +284,7 @@ def check_product_stock(product_info):
             else:
                 print(f"{product_name} 目前無庫存。")
         else:
-            print("🙁 無法獲取庫存數量，請檢查商品 Variant ID 或網站 API。")
+            print("🙁 無法確定庫存數量。請檢查日誌獲取更多錯誤訊息。")
 
 
     except requests.exceptions.RequestException as e:
