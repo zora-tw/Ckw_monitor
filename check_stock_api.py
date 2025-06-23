@@ -18,7 +18,7 @@ PRODUCTS_URLS_TO_MONITOR = [
 
 # 將最大數量調整為 999，避免觸發網站 API 的數量限制錯誤 (例如 422 錯誤)。
 # 即使設置為 999，網站也會自動限制為實際庫存量。
-MAX_QUANTITY = 400 
+MAX_QUANTITY = 300 
 
 class CartAPI:
     def __init__(self, base_url):
