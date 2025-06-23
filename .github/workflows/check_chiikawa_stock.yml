@@ -1,5 +1,5 @@
 # .github/workflows/check_chiikawa_stock.yml
-name: Chiikawa Market Stock Checker (Python)
+name: Chiikawa Market Stock Checker 
 
 on:
   schedule:
